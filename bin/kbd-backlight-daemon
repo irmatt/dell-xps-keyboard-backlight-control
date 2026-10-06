@@ -23,7 +23,7 @@ import struct
 import subprocess
 import time
 
-POLL_INTERVAL = 1.0
+POLL_INTERVAL = 2.0
 RESCAN_INTERVAL = 5.0
 MIN_LOOP = 0.5
 DEFAULT_LEVEL = 1
