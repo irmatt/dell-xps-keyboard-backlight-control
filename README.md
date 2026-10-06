@@ -13,7 +13,7 @@ set through `logind` (`org.freedesktop.login1.Session.SetBrightness`, subsystem
 ## Install
 
 ```bash
-omarchy plugin add <git-url> --enable
+omarchy plugin add https://github.com/irmatt/dell-xps-keyboard-backlight-control --enable
 ```
 
 Then add this to `~/.config/hypr/bindings.lua` and reload Hyprland:
