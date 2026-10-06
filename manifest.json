@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "irmatt.kbd-backlight",
+  "name": "Dell XPS keyboard backlight control",
+  "version": "1.0.0",
+  "author": "irmatt",
+  "description": "Restore the Dell keyboard backlight to your last level after the firmware's inactivity timeout, and toggle it off with a keybinding.",
+  "kinds": [
+    "service"
+  ],
+  "entryPoints": {
+    "service": "Service.qml"
+  }
+}

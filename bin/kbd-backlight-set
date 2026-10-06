@@ -1,0 +1,21 @@
+#!/bin/bash
+
+# Set the keyboard backlight brightness through logind, which lets the active
+# local session change it without root.
+#
+#   kbd-backlight-set <0..max>
+
+set -euo pipefail
+
+value="${1:-}"
+[[ $value =~ ^[0-9]+$ ]] || { echo "kbd-backlight-set: usage: kbd-backlight-set <0..max>" >&2; exit 2; }
+
+led=""
+for d in /sys/class/leds/*kbd_backlight*; do
+  [[ -e $d/brightness ]] && { led="$d"; break; }
+done
+[[ -n $led ]] || { echo "kbd-backlight-set: no keyboard backlight device" >&2; exit 1; }
+
+name="$(basename "$led")"
+busctl call org.freedesktop.login1 /org/freedesktop/login1/session/auto \
+  org.freedesktop.login1.Session SetBrightness ssu leds "$name" "$value" >/dev/null

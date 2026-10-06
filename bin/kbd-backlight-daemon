@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Restore the keyboard backlight to the last level the user chose.
+
+The Dell firmware turns the keyboard backlight off after the inactivity
+timeout in /sys/class/leds/*kbd_backlight*/stop_timeout but, on some models
+(XPS 17 9700), does not turn it back on when the keyboard/touchpad is used
+again. This watchdog restores the last non-zero level on the next input.
+
+It runs unprivileged: brightness is read from sysfs and set through logind
+(org.freedesktop.login1.Session.SetBrightness), which is granted to the active
+local session. "off" mode (written by bin/kbd-backlight-control) turns the
+backlight off and keeps it off.
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import os
+import re
+import select
+import struct
+import subprocess
+import time
+
+POLL_INTERVAL = 1.0
+RESCAN_INTERVAL = 5.0
+MIN_LOOP = 0.5
+DEFAULT_LEVEL = 1
+CONTROL_WINDOW = 5.0
+HEARTBEAT = 30.0
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".local/state/omarchy/kbd-backlight-autorestore")
+MODE_FILE = os.path.join(STATE_DIR, "mode")
+LEVEL_FILE = os.path.join(STATE_DIR, "level")
+STATUS_FILE = os.path.join(STATE_DIR, "status.json")
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SET_HELPER = os.path.join(HERE, "kbd-backlight-set")
+
+DEVICE_RE = re.compile(r"(keyboard|touchpad|mouse|trackpoint|pointer|hotkey)", re.I)
+
+EV_KEY, EV_REL, EV_ABS = 0x01, 0x02, 0x03
+KBDILLUM_CODES = (227, 228, 229)  # KEY_KBDILLUMTOGGLE / DOWN / UP
+EVENT = struct.Struct("=qqHHi")
+DEBUG = os.environ.get("KBD_BACKLIGHT_DEBUG") == "1"
+
+_last_status = ""
+
+
+def log(message: str) -> None:
+    print(f"kbd-backlight: {message}", flush=True)
+
+
+def debug(message: str) -> None:
+    if DEBUG:
+        log(message)
+
+
+def find_led() -> str | None:
+    preferred = "/sys/class/leds/dell::kbd_backlight"
+    if os.path.exists(os.path.join(preferred, "brightness")):
+        return preferred
+    for path in sorted(glob.glob("/sys/class/leds/*kbd_backlight*")):
+        if os.path.exists(os.path.join(path, "brightness")):
+            return path
+    return None
+
+
+def read_int(path: str, default: int = 0) -> int:
+    try:
+        with open(path) as fh:
+            return int(fh.read().strip())
+    except (OSError, ValueError):
+        return default
+
+
+def set_brightness(value: int) -> bool:
+    try:
+        result = subprocess.run(
+            [SET_HELPER, str(value)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"could not set brightness {value}: {exc}")
+        return False
+
+
+def read_mode() -> str:
+    try:
+        with open(MODE_FILE) as fh:
+            mode = fh.read().strip()
+        if mode in ("auto", "off"):
+            return mode
+    except OSError:
+        pass
+    return "auto"
+
+
+def load_level() -> int:
+    level = read_int(LEVEL_FILE, DEFAULT_LEVEL)
+    return level if level > 0 else DEFAULT_LEVEL
+
+
+def save_level(level: int) -> None:
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(LEVEL_FILE, "w") as fh:
+            fh.write(str(level))
+    except OSError as exc:
+        log(f"could not save level: {exc}")
+
+
+def write_status(mode: str, level: int, maximum: int) -> None:
+    global _last_status
+    payload = json.dumps({"mode": mode, "level": level, "max": maximum})
+    if payload == _last_status:
+        return
+    _last_status = payload
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(STATUS_FILE, "w") as fh:
+            fh.write(payload + "\n")
+    except OSError as exc:
+        log(f"could not write status: {exc}")
+
+
+def device_name(path: str) -> str:
+    sysfs = os.path.join("/sys/class/input", os.path.basename(path), "device", "name")
+    try:
+        with open(sysfs) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def open_inputs(inputs: dict[str, int]) -> None:
+    for path in sorted(glob.glob("/dev/input/event*")):
+        if path in inputs or not DEVICE_RE.search(device_name(path)):
+            continue
+        try:
+            inputs[path] = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except OSError:
+            continue
+        debug(f"watching {path} ({device_name(path)})")
+
+
+def close_stale(inputs: dict[str, int]) -> None:
+    for path, fd in list(inputs.items()):
+        if os.path.exists(path):
+            continue
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        del inputs[path]
+
+
+def drain(fd: int) -> tuple[bool, bool]:
+    """Return (activity, control) for all pending events on fd."""
+    activity = control = False
+    while True:
+        try:
+            data = os.read(fd, EVENT.size * 64)
+        except (BlockingIOError, OSError):
+            break
+        if not data:
+            break
+        for offset in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            _sec, _usec, etype, code, value = EVENT.unpack_from(data, offset)
+            if etype == EV_KEY:
+                if code in KBDILLUM_CODES and value == 1:
+                    control = True
+                elif value in (1, 2):  # press or autorepeat
+                    activity = True
+            elif etype in (EV_REL, EV_ABS):
+                activity = True
+        if len(data) < EVENT.size * 64:
+            break
+    return activity, control
+
+
+def main() -> int:
+    led = find_led()
+    if not led:
+        log("no keyboard backlight LED found")
+        return 1
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if not os.path.exists(MODE_FILE):
+        try:
+            with open(MODE_FILE, "w") as fh:
+                fh.write("auto")
+        except OSError:
+            pass
+    log(f"watching {led}")
+
+    brightness_path = os.path.join(led, "brightness")
+    maximum = read_int(os.path.join(led, "max_brightness"), 2) or 2
+    last_nonzero = load_level()
+    prev_brightness = read_int(brightness_path)
+    if prev_brightness > 0:
+        last_nonzero = prev_brightness
+        save_level(last_nonzero)
+
+    inputs: dict[str, int] = {}
+    open_inputs(inputs)
+    last_rescan = time.monotonic()
+    last_heartbeat = time.monotonic()
+    control_ts = -1e9
+    manual_off = False
+
+    while True:
+        loop_start = time.monotonic()
+        try:
+            readable, _, _ = select.select(list(inputs.values()), [], [], POLL_INTERVAL)
+        except (OSError, ValueError):
+            readable = []
+        now = time.monotonic()
+
+        activity = control = False
+        for fd in readable:
+            got_activity, got_control = drain(fd)
+            activity = activity or got_activity
+            control = control or got_control
+        if control:
+            control_ts = now
+
+        mode = read_mode()
+        brightness = read_int(brightness_path)
+        if brightness < 0:
+            brightness = prev_brightness
+
+        if mode == "off":
+            # "off" is sticky: enforce it whenever the firmware or Fn turns it on.
+            if brightness != 0:
+                set_brightness(0)
+                brightness = 0
+            manual_off = False
+        else:
+            if brightness > 0:
+                if brightness != last_nonzero:
+                    last_nonzero = brightness
+                    save_level(brightness)
+                manual_off = False
+            else:
+                if prev_brightness > 0:
+                    # A fresh off right after a backlight key is deliberate;
+                    # otherwise it is the firmware inactivity timeout.
+                    manual_off = (now - control_ts) <= CONTROL_WINDOW
+                    debug(f"LED went off; manual_off={manual_off}")
+                if activity and not manual_off:
+                    if set_brightness(last_nonzero):
+                        log(f"restored keyboard backlight to {last_nonzero}")
+                        brightness = last_nonzero
+                        manual_off = False
+
+        write_status(mode, brightness, maximum)
+        prev_brightness = brightness
+
+        if now - last_heartbeat >= HEARTBEAT:
+            debug(f"heartbeat mode={mode} brightness={brightness} manual_off={manual_off}")
+            last_heartbeat = now
+
+        if now - last_rescan >= RESCAN_INTERVAL:
+            close_stale(inputs)
+            open_inputs(inputs)
+            last_rescan = now
+
+        elapsed = time.monotonic() - loop_start
+        if elapsed < MIN_LOOP:
+            time.sleep(MIN_LOOP - elapsed)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

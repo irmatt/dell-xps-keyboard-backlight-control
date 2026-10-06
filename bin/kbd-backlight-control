@@ -1,0 +1,61 @@
+#!/bin/bash
+
+# Control the keyboard-backlight auto-on watchdog.
+#
+#   kbd-backlight-control on      restore the last level and auto-on after idle
+#   kbd-backlight-control off     turn the backlight off and keep it off
+#   kbd-backlight-control toggle  flip between the two
+#   kbd-backlight-control status  print {"mode","level","max"}
+#
+# Writes the mode file the daemon watches and applies the level immediately.
+
+set -euo pipefail
+
+HERE="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)"
+STATE_DIR="$HOME/.local/state/omarchy/kbd-backlight-autorestore"
+MODE_FILE="$STATE_DIR/mode"
+LEVEL_FILE="$STATE_DIR/level"
+STATUS_FILE="$STATE_DIR/status.json"
+mkdir -p "$STATE_DIR"
+
+led=""
+for d in /sys/class/leds/*kbd_backlight*; do
+  [[ -e $d/brightness ]] && { led="$d"; break; }
+done
+[[ -n $led ]] || { echo "kbd-backlight-control: no keyboard backlight device" >&2; exit 1; }
+
+max="$(<"$led/max_brightness")"
+mode="$(cat "$MODE_FILE" 2>/dev/null || true)"; [[ -n $mode ]] || mode=auto
+last="$(cat "$LEVEL_FILE" 2>/dev/null || true)"; [[ $last =~ ^[0-9]+$ ]] || last=1
+if (( last < 1 )); then last=1; fi
+if (( last > max )); then last=$max; fi
+
+action="${1:-status}"
+case "$action" in
+  on) mode=auto ;;
+  off) mode=off ;;
+  toggle) if [[ $mode == off ]]; then mode=auto; else mode=off; fi ;;
+  status) ;;
+  *) echo "kbd-backlight-control: usage: kbd-backlight-control <on|off|toggle|status>" >&2; exit 2 ;;
+esac
+
+if [[ $action == status ]]; then
+  # Report the level the hardware is actually at, not the intended one.
+  level="$(<"$led/brightness")"
+  printf '{"mode":"%s","level":%s,"max":%s}\n' "$mode" "$level" "$max" >"$STATUS_FILE"
+  cat "$STATUS_FILE"
+  exit 0
+fi
+
+printf '%s\n' "$mode" >"$MODE_FILE"
+if [[ $mode == off ]]; then
+  "$HERE/kbd-backlight-set" 0
+  level=0
+else
+  "$HERE/kbd-backlight-set" "$last"
+  printf '%s\n' "$last" >"$LEVEL_FILE"
+  level=$last
+fi
+
+printf '{"mode":"%s","level":%s,"max":%s}\n' "$mode" "$level" "$max" >"$STATUS_FILE"
+cat "$STATUS_FILE"
