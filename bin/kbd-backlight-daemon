@@ -29,6 +29,7 @@ MIN_LOOP = 0.5
 DEFAULT_LEVEL = 1
 CONTROL_WINDOW = 5.0
 HEARTBEAT = 30.0
+READ_INTERVAL = 2.0  # max seconds between firmware brightness reads
 
 HOME = os.path.expanduser("~")
 STATE_DIR = os.path.join(HOME, ".local/state/omarchy/kbd-backlight-autorestore")
@@ -202,10 +203,12 @@ def main() -> int:
     brightness_path = os.path.join(led, "brightness")
     maximum = read_int(os.path.join(led, "max_brightness"), 2) or 2
     last_nonzero = load_level()
-    prev_brightness = read_int(brightness_path)
-    if prev_brightness > 0:
-        last_nonzero = prev_brightness
+    cached_brightness = read_int(brightness_path)
+    if cached_brightness > 0:
+        last_nonzero = cached_brightness
         save_level(last_nonzero)
+    prev_brightness = cached_brightness
+    last_read = time.monotonic()
 
     inputs: dict[str, int] = {}
     open_inputs(inputs)
@@ -231,14 +234,25 @@ def main() -> int:
             control_ts = now
 
         mode = read_mode()
-        brightness = read_int(brightness_path)
-        if brightness < 0:
-            brightness = prev_brightness
+
+        # Reading the LED goes through Dell's SMBIOS/WMI path (~3.6 ms), so read
+        # it only when it can change our behaviour: on a slow periodic tick, or
+        # on input while we believe the backlight is off (to restore it). While
+        # the backlight is on and you are just typing, this loop does no
+        # firmware I/O at all.
+        if (now - last_read) >= READ_INTERVAL or (activity and cached_brightness == 0):
+            fresh = read_int(brightness_path)
+            if fresh >= 0:
+                cached_brightness = fresh
+            last_read = now
+
+        brightness = cached_brightness
 
         if mode == "off":
             # "off" is sticky: enforce it whenever the firmware or Fn turns it on.
             if brightness != 0:
                 set_brightness(0)
+                cached_brightness = 0
                 brightness = 0
             manual_off = False
         else:
@@ -256,6 +270,7 @@ def main() -> int:
                 if activity and not manual_off:
                     if set_brightness(last_nonzero):
                         log(f"restored keyboard backlight to {last_nonzero}")
+                        cached_brightness = last_nonzero
                         brightness = last_nonzero
                         manual_off = False
 
